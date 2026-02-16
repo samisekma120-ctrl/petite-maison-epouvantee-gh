@@ -2,12 +2,14 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "feature/**"]
   pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
   packages: write
+  security-events: write   # utile si tu ajoutes SARIF plus tard
 
 jobs:
   lint:
@@ -33,14 +35,50 @@ jobs:
       - run: pip install -r requirements.txt
       - run: pytest -q
 
-  build_docker:
+  security_scan_fs:
+    name: Security scan (Trivy - filesystem)
     runs-on: ubuntu-latest
     needs: [test]
     steps:
       - uses: actions/checkout@v4
-      - run: echo "IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}" >> $GITHUB_ENV
-      - run: docker build -t "$IMAGE" .
-      - run: docker save "$IMAGE" | gzip > image.tar.gz
+
+      # Scan des dépendances / fichiers du repo (requirements.txt, etc.)
+      - name: Trivy FS scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          # Pour la démo : on n'échoue pas le pipeline si vulnérabilités trouvées
+          # (tu peux le passer à "1" si tu veux un vrai gate)
+          exit-code: "0"
+          ignore-unfixed: true
+
+  build_docker:
+    runs-on: ubuntu-latest
+    needs: [security_scan_fs]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE" .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ env.IMAGE }}"
+          format: "table"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"      # pour la démo (mets "1" pour bloquer)
+          ignore-unfixed: true
+
+      - name: Save image as artifact
+        run: docker save "$IMAGE" | gzip > image.tar.gz
+
       - uses: actions/upload-artifact@v4
         with:
           name: docker-image
@@ -49,13 +87,19 @@ jobs:
   push_registry:
     runs-on: ubuntu-latest
     needs: [build_docker]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: docker-image
-      - run: |
+
+      - name: Load image
+        run: |
           gunzip -c image.tar.gz | docker load
           echo "IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}" >> $GITHUB_ENV
-      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - run: docker push "$IMAGE"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push to GHCR
+        run: docker push "$IMAGE"
